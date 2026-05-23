@@ -1407,3 +1407,64 @@ def test_async_to_sync_with_stopped_main_loop():
         assert result["value"] == 42
     finally:
         loop.close()
+
+
+def test_async_to_sync_with_stopped_loop_from_sync_to_async_worker():
+    """
+    Regression test for the threadlocal path.
+
+    A sync_to_async worker can outlive the loop that dispatched it: asgiref
+    wraps the executor coroutine in asyncio.shield to keep it alive across
+    cancellation, and an OS thread cannot be killed when the loop stops.
+    If the worker's still-running sync code then calls async_to_sync, it
+    reads SyncToAsync.threadlocal.main_event_loop (set by thread_handler)
+    and finds it now stopped. async_to_sync must fall back to a new loop;
+    without an is_running() guard at the point of use it deadlocks.
+    """
+    finished = threading.Event()
+    state = {}
+
+    async def inner():
+        return "inner-ok"
+
+    def blocking_sync():
+        # Runs on the sync_to_async worker thread; thread_handler has set
+        # SyncToAsync.threadlocal.main_event_loop = the driving loop. Sleep
+        # past run_until_complete so the driving loop stops under us.
+        time.sleep(0.3)
+        state["result"] = async_to_sync(inner)()
+        finished.set()
+
+    # A dedicated executor so a failure (deadlock) doesn't wedge the
+    # process-wide single_thread_executor and leak into other tests.
+    executor = ThreadPoolExecutor(max_workers=1)
+    wrapped = sync_to_async(blocking_sync, thread_sensitive=False, executor=executor)
+
+    async def driver():
+        # Fire-and-forget: dispatch the worker, then return without
+        # awaiting. This is the shape the bug hits in pytest-asyncio when
+        # the awaiting coroutine returns or is cancelled while a shielded
+        # worker is still in flight.
+        asyncio.ensure_future(wrapped())
+        await asyncio.sleep(0.1)  # let the worker actually start
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(driver())
+        assert not loop.is_running() and not loop.is_closed()
+
+        assert finished.wait(
+            timeout=5
+        ), "async_to_sync deadlocked on the stopped threadlocal loop"
+        assert state["result"] == "inner-ok"
+
+        # Drain the orphan task cleanly: its worker has finished and queued
+        # the result callback on the (stopped) loop; running the loop once
+        # more lets the orphan task complete so close() is warning-free.
+        pending = asyncio.all_tasks(loop)
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    finally:
+        if not loop.is_closed():
+            loop.close()
+        executor.shutdown(wait=False)
